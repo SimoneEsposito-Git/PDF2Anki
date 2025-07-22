@@ -37,9 +37,7 @@ Windows (CMD):
 set OPENAI_API_KEY=your-api-key-here
 ~~~
 
-⸻
-
-### How to Use
+## How to Use
 
 Run the script from your terminal. The basic command is:
 ~~~
@@ -58,5 +56,3 @@ You can specify the language and deck name:
 ~~~
 python main.py "MyNotes.pdf" --language "German" --deck-name "Meine Notizen"
 ~~~
-
-⸻
