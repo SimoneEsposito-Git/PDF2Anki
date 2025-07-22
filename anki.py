@@ -41,7 +41,7 @@ class PDFToAnkiAPI():
         self.files = []
         self.decks = {}  # Clear the question-answer pairs as well
     
-    def process_files(self, language: str = "English", count: int = 5, parallel: bool = False, **kwargs) -> List[Tuple[str, str]]:
+    def process_files(self, language: str = "English", count: int = 5, parallel: bool = True, **kwargs) -> List[Tuple[str, str]]:
         """Process the files and generate question-answer pairs"""
         if not self.files:
             raise ValueError("No files to process. Please add files using add_files method.")

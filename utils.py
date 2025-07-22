@@ -34,3 +34,17 @@ def split_content(pages: List[str], chunk_size: int = 2500, overlap: int = 500) 
         chunks.append(current_chunk)
         
     return chunks
+
+class Logger:
+    """Simple logger to print messages"""
+    @staticmethod
+    def log(message: str):
+        print(f"[LOG] {message}")
+
+    @staticmethod
+    def error(message: str):
+        print(f"[ERROR] {message}")
+    
+    @staticmethod
+    def warning(message: str):
+        print(f"[WARNING] {message}")
