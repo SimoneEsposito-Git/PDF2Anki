@@ -10,237 +10,193 @@ import fitz  # PyMuPDF for PDF reading
 from openai import OpenAI  # Updated import
 import genanki
 
+from utils import read_pdf, split_content  # Import utility functions for PDF reading and content splitting
+from pydantic import BaseModel
+
 # We'll initialize the client inside each function to avoid pickle issues
 
-def read_pdf(pdf_path: str) -> List[str]:
-    """Extract text from PDF, returning a list of pages"""
-    doc = fitz.open(pdf_path)
-    pages = []
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        pages.append(page.get_text())
-    return pages
+class QACArd(BaseModel):
+    question: str
+    answer: str
 
-def split_content(pages: List[str], chunk_size: int = 2500, overlap: int = 500) -> List[str]:
-    """Split PDF content into overlapping chunks to ensure context is preserved"""
-    chunks = []
-    current_chunk = ""
+class QADeck(BaseModel):
+    cards: List[QACArd]
+
+class PDFToAnkiAPI():
+    """Class to handle PDF to Anki conversion"""
     
-    for page in pages:
-        if len(current_chunk) + len(page) < chunk_size:
-            current_chunk += page
+    def __init__(self):
+        self.files = []  # Initialize an empty list to store files
+        self.client = None  # Placeholder for OpenAI client, initialized in methods
+        self.decks = {}  # Initialize an empty list to store question-answer pairs
+    def __repr__(self):
+        return f"PDFToAnkiAPI(files={self.files})"
+    
+    def add_files(self, files: List[str]):
+        """Add files to the API for processing"""
+        self.files.extend(files)
+    
+    def clear_files(self):
+        """Clear the list of files"""
+        self.files = []
+        self.decks = {}  # Clear the question-answer pairs as well
+    
+    def process_files(self, language: str = "English", count: int = 5, parallel: bool = False, **kwargs) -> List[Tuple[str, str]]:
+        """Process the files and generate question-answer pairs"""
+        if not self.files:
+            raise ValueError("No files to process. Please add files using add_files method.")
+        qa_pairs = {}  # Dictionary to store question-answer pairs for each file
+        # if parallel is True, use ThreadPoolExecutor to process each file in parallel
+        if parallel:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = {executor.submit(self.generate_qa_pairs, file, language, count): file for file in self.files}
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        file = futures[future]
+                        qa_pairs[file] = future.result()
+                        self.decks[file] = self.create_anki_deck(qa_pairs[file], file)
+                    except Exception as e:
+                        print(f"Error processing file {futures[future]}: {str(e)}")
         else:
-            # Add current chunk before starting a new one
-            if current_chunk:
-                chunks.append(current_chunk)
+            for file in self.files:
+                try:
+                    qa_pairs[file] = self.generate_qa_pairs(file, language, count)
+                    self.decks[file] = self.create_anki_deck(qa_pairs[file], file)
+                    
+                except Exception as e:
+                    print(f"Error processing file {file}: {str(e)}")
+        
+        return self.decks
+    
+    def generate_qa_pairs(self, file: str, language: str = "English", count: int = 5) -> List[Tuple[str, str]]:
+        """Generate question-answer pairs from a single file"""
+        if not os.path.exists(file):
+            raise ValueError(f"File not found: {file}")
+        
+        try:
+            pages = read_pdf(file)
+            chunks = split_content(pages)
+            qa_pairs = []
             
-            # Start new chunk with overlap from previous
-            if current_chunk and len(current_chunk) > overlap:
-                current_chunk = current_chunk[-overlap:] + page
+            for n, chunk in enumerate(chunks):
+                print(f"Processing chunk {n+1}/{len(chunks)} of size {len(chunk)} from file {file}")
+                qa_pairs.extend(self.process_chunk(chunk, language, count))
+            
+            return qa_pairs
+        
+        except Exception as e:
+            print(f"Error processing file {file}: {str(e)}")
+            return []
+        
+    def process_chunk(self, chunk: str, language: str = "English", count: int = 5) -> List[Tuple[str, str]]:
+        """Use LLM to generate question-answer pairs from text chunk in specified language"""
+        # Create a new client for each call to avoid pickle issues
+        api_key = os.environ.get("OPENAI_API_KEY")
+
+        if not api_key or api_key.strip() == "":
+            raise ValueError("OpenAI API key is missing. Please set the OPENAI_API_KEY environment variable.")
+
+        try:
+            client = OpenAI(api_key=api_key)
+
+            system_prompt = f"""
+            You are an expert at creating educational flashcards in {language}.
+            Analyze the provided text and extract important concepts.
+            For each concept, create a clear question and comprehensive answer pair in {language}.
+            If the text is in a different language, translate the content to {language} for the flashcards.
+            Focus on key information that would be valuable for a student to learn.
+            """
+
+            user_prompt = f"""
+            Please create up to {count} high-quality {language} flashcards from this text.
+            The text may contain educational material, and some content might implicitly 
+            have question-answer formats that need to be identified. The answers should be concise 
+            but still complete.
+
+            If the text is not in {language}, translate the concepts into {language}.
+
+            For each flashcard, provide:
+            Question in {language}
+            Short answer in {language}
+
+            TEXT:
+            {chunk}
+            """
+
+            response = client.responses.parse(
+                model="gpt-4o-mini",
+                input=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                text_format = QADeck,
+            )
+
+            content = response.output_parsed
+            qa_pairs = []
+            for card in content.cards:
+                qa_pairs.append((card.question, card.answer))
+
+            return qa_pairs
+
+        except Exception as e:
+            if "auth" in str(e).lower() or "api key" in str(e).lower():
+                raise ValueError(f"OpenAI API key error: {str(e)}. Please check your API key.")
             else:
-                current_chunk = page
-    
-    # Add the final chunk if it's not empty
-    if current_chunk:
-        chunks.append(current_chunk)
-        
-    return chunks
+                raise e
 
-def generate_qa_pairs(chunk: str, language: str = "English", count: int = 5) -> List[Tuple[str, str]]:
-    """Use LLM to generate question-answer pairs from text chunk in specified language"""
-    # Create a new client for each call to avoid pickle issues
-    api_key = os.environ.get("OPENAI_API_KEY")
-    
-    if not api_key or api_key.strip() == "":
-        raise ValueError("OpenAI API key is missing. Please set the OPENAI_API_KEY environment variable.")
-    
-    try:
-        client = OpenAI(api_key=api_key)
-        
-        system_prompt = f"""
-        You are an expert at creating educational flashcards in {language}.
-        Analyze the provided text and extract important concepts.
-        For each concept, create a clear question and comprehensive answer pair in {language}.
-        If the text is in a different language, translate the content to {language} for the flashcards.
-        Focus on key information that would be valuable for a student to learn.
-        """
-        
-        user_prompt = f"""
-        Please create up to {count} high-quality {language} flashcards from this text.
-        The text may contain educational material, and some content might implicitly 
-        have question-answer formats that need to be identified. The answers should be concise 
-        but still complete.
-        
-        If the text is not in {language}, translate the concepts into {language}.
-        
-        For each flashcard, provide:
-        Q: [question in {language}]
-        A: [short answer in {language}]
-        
-        TEXT:
-        {chunk}
-        """
-        
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+    def create_anki_deck(self, qa_pairs: List[Tuple[str, str]], deck_name: str) -> genanki.Deck:
+        """Create an Anki deck from the generated QA pairs"""
+        # Create unique IDs for model and deck
+        model_id = random.randrange(1 << 30, 1 << 31)
+        deck_id = random.randrange(1 << 30, 1 << 31)
+
+        # Create the model for the cards
+        model = genanki.Model(
+            model_id,
+            'PDF QA Model',
+            fields=[
+                {'name': 'Question'},
+                {'name': 'Answer'},
             ],
-            temperature=0.5,
-            max_tokens=2000
+            templates=[
+                {
+                    'name': 'Card',
+                    'qfmt': '{{Question}}',
+                    'afmt': '{{FrontSide}}<hr id="answer">{{Answer}}',
+                },
+            ]
         )
-        
-        content = response.choices[0].message.content
-        qa_pairs = []
-    
-        # Parse the response for Q: and A: formatted content
-        lines = content.split('\n')
-        question = None
-        answer = []
-        
-        for line in lines:
-            line = line.strip()
-            if line.startswith("Q:"):
-                # If we have a previous Q-A pair, add it
-                if question and answer:
-                    qa_pairs.append((question, "\n".join(answer)))
-                    answer = []
-                question = line[2:].strip()
-            elif line.startswith("A:"):
-                answer.append(line[2:].strip())
-            elif question and answer:  # continuation of an answer
-                answer.append(line)
-        
-        # Add the last pair if it exists
-        if question and answer:
-            qa_pairs.append((question, "\n".join(answer)))
-        
-        return qa_pairs
-    
-    except Exception as e:
-        if "auth" in str(e).lower() or "api key" in str(e).lower():
-            raise ValueError(f"OpenAI API key error: {str(e)}. Please check your API key.")
-        else:
-            raise e
 
-def create_anki_deck(qa_pairs: List[Tuple[str, str]], deck_name: str) -> genanki.Deck:
-    """Create an Anki deck from the generated QA pairs"""
-    # Create unique IDs for model and deck
-    model_id = random.randrange(1 << 30, 1 << 31)
-    deck_id = random.randrange(1 << 30, 1 << 31)
-    
-    # Create the model for the cards
-    model = genanki.Model(
-        model_id,
-        'PDF QA Model',
-        fields=[
-            {'name': 'Question'},
-            {'name': 'Answer'},
-        ],
-        templates=[
-            {
-                'name': 'Card',
-                'qfmt': '{{Question}}',
-                'afmt': '{{FrontSide}}<hr id="answer">{{Answer}}',
-            },
-        ]
-    )
-    
-    # Create the deck
-    deck = genanki.Deck(deck_id, deck_name)
-    
-    # Add cards to the deck
-    for question, answer in qa_pairs:
-        note = genanki.Note(
-            model=model,
-            fields=[question, answer]
-        )
-        deck.add_note(note)
-    
-    return deck
+        # Create the deck
+        deck = genanki.Deck(deck_id, deck_name)
 
-def save_to_csv(qa_pairs: List[Tuple[str, str]], output_path: str):
-    """Save question-answer pairs to a CSV file"""
-    csv_path = output_path.replace('.apkg', '.csv')
-    print(f"Saving flashcards to CSV: {csv_path}")
-    
-    with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(['Question', 'Answer'])
+        # Add cards to the deck
         for question, answer in qa_pairs:
-            writer.writerow([question, answer])
-    
-    print(f"CSV file saved: {csv_path}")
+            note = genanki.Note(
+                model=model,
+                fields=[question, answer]
+            )
+            deck.add_note(note)
 
-def process_chunk(chunk_info):
-    """Process a single chunk to generate QA pairs"""
-    chunk, index, total, language = chunk_info
-    print(f"Processing chunk {index+1}/{total} in {language}")
-    try:
-        qa_pairs = generate_qa_pairs(chunk, language, count = 2)
-        print(f"Generated {len(qa_pairs)} QA pairs from chunk {index+1}")
-        return (index, qa_pairs)  # Return index along with QA pairs to maintain order
-    except Exception as e:
-        print(f"Error processing chunk {index+1}: {str(e)}")
-        # Return an empty list instead of propagating the error
-        return (index, [])
+        return deck
 
-def pdf_to_anki(pdf_path: str, output_path: str = None, deck_name: str = None, max_workers: int = None, language: str = "English"):
-    """Process a PDF and convert it to Anki cards"""
-    # Set default values
-    if not deck_name:
-        deck_name = Path(pdf_path).stem
-    if not output_path:
-        output_path = f"{Path(pdf_path).stem}_flashcards.apkg"
-    
-    print(f"Reading PDF: {pdf_path}")
-    pages = read_pdf(pdf_path)
-    print(f"Found {len(pages)} pages")
-    
-    print("Splitting content into chunks...")
-    chunks = split_content(pages)
-    print(f"Created {len(chunks)} chunks")
-    
-    ordered_results = []
-    
-    # Use ThreadPoolExecutor instead of ProcessPoolExecutor
-    print(f"Processing chunks in parallel with {max_workers or 'default'} workers...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Prepare the chunks with their indices for the worker function
-        chunk_data = [(chunk, i, len(chunks), language) for i, chunk in enumerate(chunks)]
-        
-        # Execute the processing in parallel and collect results
-        future_to_chunk = {executor.submit(process_chunk, chunk_info): chunk_info[1] for chunk_info in chunk_data}
-        
-        for future in concurrent.futures.as_completed(future_to_chunk):
-            try:
-                index, qa_pairs = future.result()
-                ordered_results.append((index, qa_pairs))
-            except Exception as e:
-                chunk_index = future_to_chunk[future]
-                print(f"Error processing chunk {chunk_index+1}: {str(e)}")
-                ordered_results.append((chunk_index, []))
-    
-    # Sort results by chunk index to maintain the original order
-    ordered_results.sort(key=lambda x: x[0])
-    
-    # Extract all QA pairs in the correct order
-    all_qa_pairs = []
-    for _, qa_pairs in ordered_results:
-        all_qa_pairs.extend(qa_pairs)
-    
-    print(f"Total flashcards generated: {len(all_qa_pairs)}")
-    
-    # Save to CSV file
-    save_to_csv(all_qa_pairs, output_path)
-    
-    print("Creating Anki deck...")
-    deck = create_anki_deck(all_qa_pairs, deck_name)
-    
-    print(f"Saving deck to {output_path}")
-    genanki.Package(deck).write_to_file(output_path)
-    print("Done!")
+    def download_deck(self, deck: genanki.Deck, output_path: str, save_csv: bool = True):
+        """Save the Anki deck to a file"""
+        if save_csv:
+            csv_path = output_path.replace('.apkg', '.csv')
+            print(f"Saving flashcards to CSV: {csv_path}")
+            with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['Question', 'Answer'])
+                for note in deck.notes:
+                    writer.writerow([note.fields[0], note.fields[1]])
+            print(f"CSV file saved: {csv_path}")
+            
+        # Save the deck to an Anki package file
+        print(f"Saving deck to {output_path}")
+        genanki.Package(deck).write_to_file(output_path)
+        print("Deck saved successfully!")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate Anki flashcards from PDF files")
@@ -249,7 +205,32 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--deck-name", help="Name for the Anki deck")
     parser.add_argument("-w", "--workers", type=int, help="Number of parallel workers (default: use all available CPUs)", default=None)
     parser.add_argument("-l", "--language", help="Target language for flashcards", default="English")
+    parser.add_argument("-c", "--count", type=int, help="Number of flashcards to generate per chunk", default=5)
     
     args = parser.parse_args()
     
-    pdf_to_anki(args.pdf_path, args.output, args.deck_name, args.workers, args.language)
+    # Ensure the output directory exists
+    if args.output:
+        output_dir = Path(args.output).parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        args.output = "output.apkg"
+        output_dir = Path(".")
+    # Initialize the API
+    api = PDFToAnkiAPI()
+    # Add the PDF file to the API
+    print(f"Adding PDF file: {args.pdf_path}")
+    api.add_files([args.pdf_path])
+    # Process the files and generate question-answer pairs
+    print(f"Processing files: {api.files}")
+    decks = api.process_files(language=args.language, count=args.count, parallel=args.workers is not None)
+    # Save the Anki deck to a file
+    if args.deck_name is None:
+        args.deck_name = Path(args.pdf_path).stem  # Use the PDF filename as the deck name
+    if args.output is None:
+        args.output = output_dir / f"{args.deck_name}.apkg"
+    for file, deck in decks.items():
+        print(f"Saving deck for file {file} to {args.output}")
+        api.download_deck(deck, args.output)
+    
+    # pdf_to_anki(args.pdf_path, args.output, args.deck_name, args.workers, args.language)
