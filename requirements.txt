@@ -1,4 +1,11 @@
-PyMuPDF==1.24.4
-openai==1.97.1
-genanki==0.13.0
-PyQt5==5.15.10
+openai
+langchain
+langchain-community
+langchain-openai
+pydantic
+fitz  # PyMuPDF
+genanki
+python-dotenv
+textwrap3  # covers stdlib fallback
+tiktoken
+pdfminer.six
